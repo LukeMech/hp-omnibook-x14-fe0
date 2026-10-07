@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fetch the ADSP firmware as soon as a connection comes up (no-op once installed).
+[ "$2" = "up" ] && exec systemctl start --no-block omnibook-adsp-firmware.service
+exit 0

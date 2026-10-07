@@ -1,0 +1,21 @@
+#!/usr/bin/bash
+# Right after the ADSP starts, qcom_battmgr briefly reports placeholder capacities
+# (energy_full ~ the current energy, energy_full_design 0). UPower reads energy_full
+# only once, when the battery appears, so it would keep showing ~100%.
+# At boot UPower is ordered after this service, so it starts only once the real values
+# are in. When the ADSP starts later (firmware fetched on first boot), UPower is
+# already running: restart it to re-read them.
+set -u
+
+bat=/sys/class/power_supply/qcom-battmgr-bat
+for _ in $(seq 60); do
+    design=$(cat "${bat}/energy_full_design" 2>/dev/null || echo 0)
+    ((design > 0)) && break
+    sleep 1
+done
+# A moment more for energy_full itself.
+sleep 5
+echo "battery: energy_full_design=$(cat "${bat}/energy_full_design" 2>/dev/null) energy_full=$(cat "${bat}/energy_full" 2>/dev/null)"
+if systemctl is-active -q upower.service; then
+    systemctl restart --no-block upower.service
+fi

@@ -1,0 +1,17 @@
+[Unit]
+Description=Fetch the ADSP firmware from HP's driver softpaq (when missing or outdated)
+# Downloads from ftp.hp.com, so only with network: at boot after network-online.target,
+# and on every new connection (NetworkManager dispatcher, 90-omnibook-adsp-firmware).
+# A no-op once the pinned softpaq is installed. If HP's server fails, Restart= retries.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/omnibook-adsp-firmware
+ExecStartPost=/usr/bin/systemctl start omnibook-adsp.service
+Restart=on-failure
+RestartSec=5min
+
+[Install]
+WantedBy=multi-user.target

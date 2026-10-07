@@ -1,0 +1,3 @@
+# https://fedoraproject.org/wiki/Snapdragon_WoA_Laptop_Install
+# firmware_class.path: where omnibook-adsp-firmware puts the ADSP firmware.
+kargs = ["clk_ignore_unused", "pd_ignore_unused", "systemd.tpm2_wait=0", "firmware_class.path=/var/lib/omnibook-firmware"]

@@ -1,0 +1,18 @@
+[Unit]
+Description=Keep the KVM boot entries current (slbounce, tcblaunch.exe, GRUB menu)
+Documentation=https://github.com/TravMurav/slbounce
+# Enabled by `omnibook-kvm enable` (opt-in). At every boot: new deployments get their
+# "(KVM)" entry. Only the first run downloads (tcblaunch.exe from Windows' ISO).
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omnibook-kvm update
+# A ~5 GB download; a failed one resumes on retry.
+TimeoutStartSec=3h
+Restart=on-failure
+RestartSec=10min
+
+[Install]
+WantedBy=multi-user.target

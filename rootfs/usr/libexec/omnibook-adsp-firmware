@@ -1,0 +1,49 @@
+#!/usr/bin/bash
+# Extract the HP OmniBook X 14 (14-fe0) firmware Linux can't ship from HP's driver
+# softpaq -- the same files Fedora's qcom-firmware-extract copies from a Windows
+# partition: the ADSP's (battery status) and the GPU's zap shader (hardware-accelerated
+# graphics). HP's firmware can't be redistributed, hence done here.
+#
+# The softpaq and file list are pinned below. A no-op while the installed firmware came
+# from exactly those; when an image update changes either, the next run fetches again.
+#
+# Usage: omnibook-adsp-firmware [SOFTPAQ.exe]   (default: download it from HP)
+# DEST_ROOT overrides /var/lib/omnibook-firmware.
+set -euo pipefail
+
+SOFTPAQ_URL="https://ftp.hp.com/pub/softpaq/sp171501-172000/sp171528.exe"
+SOFTPAQ_SHA256="3937fa23b6cf28fae5161d1aa717043b4fcb119300e7478a76405a6617460978"
+ROOT="${DEST_ROOT:-/var/lib/omnibook-firmware}"
+DEST="${ROOT}/qcom/x1e80100/hp/omnibook-x14"
+STAMP="${ROOT}/softpaq.sha256"
+FILES=(qcadsp8380.mbn adsp_dtbs.elf adspr.jsn adsps.jsn adspua.jsn battmgr.jsn qcdxkmsuc8380.mbn)
+# What's installed: the softpaq's checksum and the file list.
+STAMP_CONTENT="${SOFTPAQ_SHA256} ${FILES[*]}"
+
+if [[ -z "${1:-}" && "$(cat "${STAMP}" 2>/dev/null)" == "${STAMP_CONTENT}" ]]; then
+    echo "Firmware is up to date"
+    exit 0
+fi
+
+work="$(mktemp -d -p /var/tmp omnibook-fw.XXXXXX)"
+trap 'rm -rf "${work}"' EXIT
+
+softpaq="${1:-${work}/softpaq.exe}"
+if [[ -z "${1:-}" ]]; then
+    curl -fL --retry 3 -o "${softpaq}" "${SOFTPAQ_URL}"
+    echo "${SOFTPAQ_SHA256}  ${softpaq}" | sha256sum -c -
+fi
+
+includes=()
+for f in "${FILES[@]}"; do includes+=("-ir!${f}"); done
+7z x -y -bso0 -bsp0 -o"${work}/x" "${softpaq}" "${includes[@]}"
+
+mkdir -p "${DEST}.new"
+for f in "${FILES[@]}"; do
+    found="$(find "${work}/x" -type f -name "${f}" | head -n1)"
+    [[ -n "${found}" ]] || { echo "error: ${f} not in softpaq" >&2; exit 1; }
+    install -m0644 "${found}" "${DEST}.new/${f}"
+done
+rm -rf "${DEST}" && mv "${DEST}.new" "${DEST}"
+echo "$(sha256sum "${softpaq}" | cut -d' ' -f1) ${FILES[*]}" > "${STAMP}"
+echo "Firmware installed to ${DEST} (GPU acceleration from the next login; a running ADSP picks up new firmware on reboot)"

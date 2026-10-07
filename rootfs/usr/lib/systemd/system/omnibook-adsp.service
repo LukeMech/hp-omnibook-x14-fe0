@@ -1,0 +1,16 @@
+[Unit]
+Description=Start the ADSP (battery status) with the firmware from the HP softpaq
+ConditionPathExists=/var/lib/omnibook-firmware/qcom/x1e80100/hp/omnibook-x14/qcadsp8380.mbn
+# Not in EL2 (omnibook-kvm): Linux can't start the ADSP there yet.
+ConditionKernelCommandLine=!lm-desktop.kvm
+After=local-fs.target
+# UPower waits for the battery to settle (omnibook-battery-settle.service).
+Wants=omnibook-battery-settle.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/modprobe qcom_q6v5_pas
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,315 @@
+#!/usr/bin/bash
+# KVM on the OmniBook (opt-in, experimental). Snapdragon X firmware starts Linux in
+# EL1 under Qualcomm's hypervisor (Gunyah), so there's no /dev/kvm. slbounce (an EFI
+# driver) uses Secure Launch -- Windows' tcblaunch.exe, signed by Microsoft -- to take
+# EL2 over instead: https://github.com/TravMurav/slbounce
+#
+#   omnibook-kvm enable    fetch tcblaunch.exe, set up the boot chain and "(KVM)" entries
+#   omnibook-kvm version <v>  use another tcblaunch.exe (see TCB_VERSIONS)
+#   omnibook-kvm disable   remove it all again
+#   omnibook-kvm status
+#   omnibook-kvm update    what omnibook-kvm.service runs at every boot once enabled:
+#                          keeps the EFI files and the GRUB entries current
+#
+# Fedora's GRUB can't load EFI drivers (no chainloader), so systemd-boot goes first: a
+# firmware boot entry "LM Desktop (slbounce)" starts it from the ESP, it loads
+# slbounce (EFI/systemd/drivers/) and hands over to GRUB right away (timeout 0; hold
+# Space for its menu). slbounce then waits for ExitBootServices and only switches when
+# the device tree is an EL2 one -- the normal entries boot as before. A "(KVM)" GRUB
+# entry boots kernel-core's plain image with the EL2 device tree (upstream's x1-el2
+# overlay) and id_aa64mmfr0.ecv=1 (the firmware resets on CNTPOFF_EL2). In EL2 Linux
+# can't start the ADSP yet: no battery status and no sound there (omnibook-adsp is
+# skipped); GPU and WiFi work.
+#
+# tcblaunch.exe can't be shipped: it's fetched from Microsoft's symbol server (the plain
+# signed PE, ~0.9 MB) and checked by SHA-256. Which version works depends on the device:
+# Microsoft removed the error handling slbounce relies on from some builds, and too old
+# ones don't support X1E. 26100.4351 is the default: confirmed on X1E (also where others
+# failed). `omnibook-kvm version <v>` picks another one from TCB_VERSIONS.
+set -euo pipefail
+
+# Known tcblaunch.exe builds, newest first. id: the symbol-server path (PE timestamp +
+# image size). Notes: reports with slbounce's sltest, from aarch64-laptops.
+#  version     id              sha256                                                            notes
+TCB_VERSIONS="
+26100.4946  A1441DEE100000  cc4df98c6c345d44d862f5516c5cbac39d65ab6d51a2f981874e0898e049660d  untested
+26100.4351  66A7C7F3100000  463520e19581da964834b4f07b19303665dc701de31c6ad748ef8cbd1333e548  works on the OmniBook X 14; X1E (Vivobook, ...)
+26100.4202  1A6BCFCB100000  ebd5a320fb4a16e9b725f615e9acc078619cb5c54362b43140a07572783ad1dd  untested
+26100.2033  19FA956Cf7000   2728ce67077f8603306222fb801ab482a26a720904ceddb06dfcfeddc8702b19  untested (late 2024)
+26100.1742  EC74C165f6000   5dfcd0253b6ee99499ab33cac221e8a9cea47f3fdf6d4e11de9a9f3c4770d03d  works on X1E (Yoga Slim 7x); resets the OmniBook
+26100.1591  82BCD8E6f6000   311d1c64966172fd7a815dcc956f40883312335279918d8f58e8068ea0b07a9c  untested
+22621.4317  BEB81838ed000   799c8ceed00db4d0126aa373bd68a754098df5412b17f6f3b63e01d3cf7ff81e  works on sc8280xp (X13s); likely too old for X1E
+"
+TCB_DEFAULT=26100.4351
+CACHE=/var/cache/omnibook-kvm
+SLBOUNCE=/usr/lib/slbounce
+KERNEL=usr/lib/omnibook-kvm/vmlinuz
+# The EL2 device tree, fixed at build time (04-kvm.sh: upstream's -el2 dtb without the
+# remoteproc iommus that hang 7.1+ kernels at boot).
+DTB=usr/lib/omnibook-kvm/kvm.dtb
+# earlycon=efifb keep_bootcon, without rhgb quiet: kernel messages on screen from the
+# first line (still experimental: shows where it stops). cpuidle.off=1: in EL2 the
+# CPUs' deeper idle states (PSCI, no longer behind Qualcomm's hypervisor) make the
+# touchscreen and touchpad lag -- as in Windows, which runs in EL2 too; idle is plain
+# WFI then (costs some battery).
+KARGS="id_aa64mmfr0.ecv=1 lm-desktop.kvm earlycon=efifb keep_bootcon cpuidle.off=1"
+CUSTOM_CFG=/boot/grub2/custom.cfg
+BEGIN='### BEGIN omnibook-kvm ###'
+END='### END omnibook-kvm ###'
+ESP_TYPE=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+SDBOOT=/usr/lib/systemd/boot/efi/systemd-bootaa64.efi
+FW_LABEL="LM Desktop (slbounce)"
+SECUREBOOT_VAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+
+die() { echo "omnibook-kvm: $*" >&2; exit 1; }
+
+secure_boot_on() {
+    [[ -r "${SECUREBOOT_VAR}" ]] && (($(od -An -tu1 -j4 -N1 "${SECUREBOOT_VAR}") == 1))
+}
+
+# The chosen version (omnibook-kvm version), else the default.
+tcb_version() {
+    cat "${CACHE}/version" 2>/dev/null || echo "${TCB_DEFAULT}"
+}
+
+# tcblaunch.exe of the chosen version into ${CACHE}, checked against its SHA-256.
+fetch_tcblaunch() {
+    local version id sha tcb="${CACHE}/tcblaunch.exe"
+    version=$(tcb_version)
+    read -r _ id sha _ < <(grep "^${version} " <<<"${TCB_VERSIONS}") ||
+        die "unknown tcblaunch.exe version ${version}"
+    if [[ -f "${tcb}" ]] && echo "${sha}  ${tcb}" | sha256sum -c --status; then
+        return 0
+    fi
+    mkdir -p "${CACHE}"
+    echo "Fetching tcblaunch.exe ${version} from Microsoft's symbol server..."
+    curl -fsSL --retry 5 -o "${tcb}.new" \
+        "https://msdl.microsoft.com/download/symbols/tcblaunch.exe/${id}/tcblaunch.exe"
+    echo "${sha}  ${tcb}.new" | sha256sum -c --status ||
+        die "tcblaunch.exe ${version}: unexpected SHA-256"
+    mv "${tcb}.new" "${tcb}"
+}
+
+# The ESP (not mounted on bootc systems): the one on /boot's disk.
+esp_device() {
+    local src disk
+    src=$(findmnt -no SOURCE -T /boot | sed 's/\[.*//')
+    disk=$(lsblk -no PKNAME "${src}")
+    lsblk -lnpo PATH,PARTTYPE "/dev/${disk}" | awk -v t="${ESP_TYPE}" 'tolower($2) == t { print $1; exit }'
+}
+
+ESP=
+ESP_DEV=
+mount_esp() {
+    ESP_DEV=$(esp_device)
+    [[ -n "${ESP_DEV}" ]] || die "no EFI system partition found"
+    ESP=$(mktemp -d)
+    mount -t vfat "${ESP_DEV}" "${ESP}"
+}
+umount_esp() {
+    [[ -n "${ESP}" ]] || return 0
+    umount "${ESP}" && rmdir "${ESP}"
+    ESP=
+}
+
+BOOT_WAS_RO=
+boot_rw() {
+    if findmnt -no OPTIONS /boot | tr , '\n' | grep -qx ro; then
+        mount -o remount,rw /boot
+        BOOT_WAS_RO=1
+    fi
+}
+boot_restore() {
+    [[ -z "${BOOT_WAS_RO}" ]] || mount -o remount,ro /boot
+    BOOT_WAS_RO=
+}
+
+cleanup() { umount_esp; boot_restore; }
+trap cleanup EXIT
+
+# Replace our block in /boot/grub2/custom.cfg (sourced by the GRUB menu after the
+# BLS entries) with stdin; empty input removes it.
+write_custom_cfg() {
+    local block other
+    block=$(cat)
+    other=""
+    [[ -f "${CUSTOM_CFG}" ]] && other=$(sed "/^${BEGIN}$/,/^${END}$/d" "${CUSTOM_CFG}")
+    {
+        [[ -z "${other}" ]] || printf '%s\n' "${other}"
+        [[ -z "${block}" ]] || printf '%s\n%s\n%s\n' "${BEGIN}" "${block}" "${END}"
+    } >"${CUSTOM_CFG}.new"
+    if [[ -s "${CUSTOM_CFG}.new" ]]; then
+        mv "${CUSTOM_CFG}.new" "${CUSTOM_CFG}"
+    else
+        rm -f "${CUSTOM_CFG}.new" "${CUSTOM_CFG}"
+    fi
+}
+
+bls() { sed -n "s/^$2 \+//p" "$1" | head -n1; }
+
+# One "(KVM)" menu entry, for the default deployment (the BLS entry with the highest
+# version, as GRUB orders them). Its plain kernel and EL2 device tree go next to the
+# deployment's kernel in /boot (removed with it by ostree).
+menu_entries() {
+    local entry options linux initrd ostree deploy kdir dtb host
+    entry=$(grep -H '^version ' /boot/loader/entries/ostree-*.conf 2>/dev/null |
+        sort -t' ' -k2 -n -r | head -n1 | cut -d: -f1 || true)
+    [[ -n "${entry}" ]] || return 0
+    options=$(bls "${entry}" options | tr ' ' '\n' | grep -vxE 'rhgb|quiet' | paste -sd ' ')
+    linux=$(bls "${entry}" linux)
+    initrd=$(bls "${entry}" initrd)
+    ostree=$(tr ' ' '\n' <<<"${options}" | sed -n 's/^ostree=//p')
+    deploy=$(readlink -f "/sysroot${ostree}") || return 0
+    [[ -f "${deploy}/${KERNEL}" ]] || return 0
+    dtb="${deploy}/${DTB}"
+    [[ -f "${dtb}" ]] || return 0
+
+    # BLS paths are relative to /boot's filesystem.
+    kdir=$(dirname "${linux}")
+    host="/boot${kdir#/boot}"
+    cmp -s "${deploy}/${KERNEL}" "${host}/vmlinuz-kvm" ||
+        install -m0644 "${deploy}/${KERNEL}" "${host}/vmlinuz-kvm"
+    cmp -s "${dtb}" "${host}/kvm.dtb" || install -m0644 "${dtb}" "${host}/kvm.dtb"
+
+    cat <<EOF
+menuentry 'LM Desktop (KVM)' --class lm-desktop {
+	linux ${kdir}/vmlinuz-kvm ${options} ${KARGS}
+	devicetree ${kdir}/kvm.dtb
+	initrd ${initrd}
+}
+EOF
+}
+
+# systemd-boot on the ESP: loads slbounce as a driver, then starts GRUB (directly, not
+# via shim: Secure Boot is off).
+install_esp() {
+    [[ -f "${ESP}/EFI/fedora/grubaa64.efi" ]] || die "no EFI/fedora/grubaa64.efi on the ESP"
+    mkdir -p "${ESP}/EFI/lm-kvm" "${ESP}/EFI/systemd/drivers" "${ESP}/loader/entries"
+    # slbounce opens tcblaunch.exe from the root of the volume it was loaded from.
+    cmp -s "${CACHE}/tcblaunch.exe" "${ESP}/tcblaunch.exe" || cp "${CACHE}/tcblaunch.exe" "${ESP}/tcblaunch.exe"
+    # systemd-boot loads drivers named *aa64.efi.
+    cmp -s "${SLBOUNCE}/slbounce.efi" "${ESP}/EFI/systemd/drivers/slbounceaa64.efi" ||
+        cp "${SLBOUNCE}/slbounce.efi" "${ESP}/EFI/systemd/drivers/slbounceaa64.efi"
+    cmp -s "${SDBOOT}" "${ESP}/EFI/lm-kvm/systemd-bootaa64.efi" ||
+        cp "${SDBOOT}" "${ESP}/EFI/lm-kvm/systemd-bootaa64.efi"
+    printf 'default grub.conf\ntimeout 0\nauto-entries no\n' >"${ESP}/loader/loader.conf"
+    printf 'title LM Desktop (GRUB)\nefi /EFI/fedora/grubaa64.efi\n' >"${ESP}/loader/entries/grub.conf"
+    rm -f "${ESP}/loader/entries/sltest.conf" "${ESP}/EFI/lm-kvm/sltest.efi"
+
+    # The firmware boot entry, first in the boot order (efibootmgr -c puts it there).
+    if ! efibootmgr | grep -q "${FW_LABEL}"; then
+        efibootmgr -q -c -d "/dev/$(lsblk -no PKNAME "${ESP_DEV}")" -p "$(lsblk -no PARTN "${ESP_DEV}")" \
+            -L "${FW_LABEL}" -l '\EFI\lm-kvm\systemd-bootaa64.efi'
+    fi
+}
+
+remove_esp() {
+    local num
+    for num in $(efibootmgr | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\*\? ${FW_LABEL}.*/\1/p"); do
+        efibootmgr -q -b "${num}" -B
+    done
+    rm -rf "${ESP}/EFI/lm-kvm" "${ESP}/tcblaunch.exe" "${ESP}/loader" \
+        "${ESP}/EFI/systemd/drivers/slbounceaa64.efi"
+    rmdir "${ESP}/EFI/systemd/drivers" "${ESP}/EFI/systemd" 2>/dev/null || true
+}
+
+# A leftover one-shot entry (LoaderEntryOneShot) can loop: the firmware may lose
+# systemd-boot's delete of it when the next boot resets hard. Removed whenever we run.
+clear_oneshot() {
+    local v=/sys/firmware/efi/efivars/LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+    [[ -e "${v}" ]] || return 0
+    chattr -i "${v}" 2>/dev/null || true
+    rm -f "${v}"
+}
+
+list_entries() {
+    sed -n "/^${BEGIN}$/,/^${END}$/p" "${CUSTOM_CFG}" | grep -o "^menuentry '[^']*'" | cut -d"'" -f2 | sed 's/^/  /'
+}
+
+update() {
+    clear_oneshot
+    if secure_boot_on; then
+        echo "omnibook-kvm: Secure Boot is on -- slbounce can't run, no KVM entries" >&2
+        boot_rw
+        write_custom_cfg </dev/null
+        return 0
+    fi
+    fetch_tcblaunch
+
+    mount_esp
+    install_esp
+    umount_esp
+
+    boot_rw
+    menu_entries | write_custom_cfg
+    echo "KVM entries in the GRUB menu:"
+    list_entries
+}
+
+disable() {
+    clear_oneshot
+    systemctl disable --now omnibook-kvm.service || true
+    boot_rw
+    write_custom_cfg </dev/null
+    rm -f /boot/ostree/*/vmlinuz-kvm /boot/ostree/*/kvm.dtb
+    mount_esp
+    remove_esp
+    echo "KVM entries removed."
+}
+
+status() {
+    if [[ -e /dev/kvm ]]; then
+        echo "KVM: available (/dev/kvm) -- booted in EL2"
+    else
+        echo "KVM: not available (booted in EL1, under Qualcomm's hypervisor)"
+    fi
+    if secure_boot_on; then echo "Secure Boot: on (must be off for KVM)"; else echo "Secure Boot: off"; fi
+    echo "omnibook-kvm.service: $(systemctl is-enabled omnibook-kvm.service 2>/dev/null || true)"
+    if [[ -f "${CACHE}/tcblaunch.exe" ]]; then
+        echo "tcblaunch.exe: $(tcb_version)"
+    else
+        echo "tcblaunch.exe: not fetched ($(tcb_version) when enabled)"
+    fi
+    echo "Known tcblaunch.exe versions (sudo omnibook-kvm version <v>):"
+    awk -v cur="$(tcb_version)" 'NF { notes = $0; sub(/^([^ ]+ +){3}/, "", notes); printf "  %s %-11s %s\n", ($1 == cur ? "*" : " "), $1, notes }' <<<"${TCB_VERSIONS}"
+    if [[ -f "${CUSTOM_CFG}" ]] && grep -q "^${BEGIN}$" "${CUSTOM_CFG}"; then
+        echo "GRUB entries:"
+        list_entries
+    fi
+}
+
+case "${1:-}" in
+enable)
+    ((EUID == 0)) || die "run as root (sudo)"
+    secure_boot_on && die "turn Secure Boot off first (in the firmware setup: F10 at power-on)"
+    systemctl enable omnibook-kvm.service
+    update
+    echo
+    echo "Power off fully, then in the GRUB menu (1 s, press an arrow key) pick"
+    echo "\"LM Desktop (KVM)\" -- no battery status and no sound there. If it resets, power"
+    echo "off again and try another tcblaunch.exe: omnibook-kvm version <v>."
+    ;;
+disable)
+    ((EUID == 0)) || die "run as root (sudo)"
+    disable
+    ;;
+version)
+    ((EUID == 0)) || die "run as root (sudo)"
+    grep -q "^${2:-none} " <<<"${TCB_VERSIONS}" ||
+        die "usage: omnibook-kvm version <$(awk 'NF { printf "%s|", $1 }' <<<"${TCB_VERSIONS}" | sed 's/|$//')>"
+    mkdir -p "${CACHE}"
+    echo "${2}" >"${CACHE}/version"
+    update
+    echo
+    echo "Power off fully (not a reboot) before trying \"LM Desktop (KVM)\" with it."
+    ;;
+update)
+    ((EUID == 0)) || die "run as root (sudo)"
+    update
+    ;;
+status) status ;;
+*)
+    echo "usage: omnibook-kvm enable|version <v>|disable|status|update" >&2
+    exit 2
+    ;;
+esac

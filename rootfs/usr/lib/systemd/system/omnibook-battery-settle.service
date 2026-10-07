@@ -1,0 +1,13 @@
+[Unit]
+Description=Wait for the ADSP to report the battery's real capacity, before UPower reads it
+# Started by omnibook-adsp.service (Wants=); UPower is ordered after this
+# (upower.service.d/10-omnibook-battery.conf). Skipped without the firmware.
+ConditionPathExists=/var/lib/omnibook-firmware/qcom/x1e80100/hp/omnibook-x14/qcadsp8380.mbn
+# Not in EL2 (omnibook-kvm): Linux can't start the ADSP there yet.
+ConditionKernelCommandLine=!lm-desktop.kvm
+After=omnibook-adsp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/omnibook-battery-settle
+TimeoutStartSec=90
